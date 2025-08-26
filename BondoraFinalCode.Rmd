@@ -1,0 +1,1169 @@
+---
+title: "Bondora Analysis"
+author: '200234120'
+date: "2025-08-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+set.seed(123)
+
+library(ggplot2)
+library(plyr)
+library(reshape2)
+library(splines)
+library(boot)
+library(broom)
+library(knitr)
+library(lubridate)
+library(caret)
+library(gam)
+library(glmnet)
+library(klaR)
+library(dplyr)
+library(RColorBrewer)
+library(data.table)
+library(tidyr)
+library(corrplot)
+library(DataExplorer)
+library(knitr)
+library(caret)
+library(xgboost)
+library(nnet)
+library(pROC)
+library(UBL)
+library(forcats)
+library(pROC)
+library(PRROC)
+library(ranger)
+library(Matrix)
+
+
+options(scipen = 4)
+```
+
+```{r}
+
+loan_data_raw <- read.csv("~/Downloads/LoanData_Bondora.csv", stringsAsFactors = FALSE)
+
+
+```
+
+
+```{r}
+
+#Here I removed non related and data leakage variables
+
+initial_drop <- c(
+  "ReportAsOfEOD","LoanId","LoanNumber","ListedOnUTC","DateOfBirth",
+  "BiddingStartedOn","UserName","NextPaymentNr","NrOfScheduledPayments",
+  "LoanApplicationStartedDate","ApplicationSignedHour","ApplicationSignedWeekday",
+  "ActiveScheduleFirstPaymentReached", "PlannedInterestTillDate","ExpectedLoss",
+  "LossGivenDefault","ExpectedReturn", "ProbabilityOfDefault","PrincipalOverdueBySchedule", 
+  "StageActiveSince","ModelVersion","WorseLateCategory","BidsApi","BidsManual","BidsPortfolioManager")
+
+leakage_drop <- c(
+  "RecoveryStage", "ActiveLateCategory","ActiveLateLastPaymentCategory",
+  "CurrentDebtDaysPrimary","CurrentDebtDaysSecondary",
+  "DebtOccuredOn", "DebtOccuredOnForSecondary", "GracePeriodStart",
+  "GracePeriodEnd", "NextPaymentDate", "NextPaymentNr","OnSaleSince",
+  "ReScheduledOn","EAD1", "EAD2", "XIRR","ExpectedLoss","ExpectedReturn", 
+  "LossGivenDefault","ProbabilityOfDefault", "PrincipalOverdueBySchedule",
+  "InterestAndPenaltyBalance", "InterestAndPenaltyPaymentsMade",
+  "PrincipalPaymentsMade","PrincipalBalance", "InterestRecovery",
+  "PrincipalRecovery", "NoteLoanLateChargesPaid","NoteLoanTransfersInterestAmount", 
+  "NoteLoanTransfersMainAmount","PenaltyLateAmount","PrincipalWriteOffs",
+  "InterestAndPenaltyWriteOffs", "SoldInResale_Date", "SoldInResale_Price", 
+  "Restructured", "SoldInResale_Principal","LastPaymentOn")
+
+to_drop <- union(initial_drop, leakage_drop)
+to_drop <- intersect(to_drop, names(loan_data_raw))
+loan_data <- loan_data_raw %>% dplyr::select(-all_of(to_drop))
+
+loan_data <- loan_data %>%
+  mutate(across(where(is.character), ~ na_if(., "NA"))) %>%
+  mutate(across(where(is.character), ~ na_if(., "")))
+
+
+# Here I dropped columns with >50% missing
+
+drop_na_cols <- names(loan_data)[colMeans(is.na(loan_data)) > 0.5]
+loan_data <- loan_data %>% dplyr::select(-all_of(drop_na_cols))
+
+unique(loan_data$Status)
+
+# Here I removed 'Current' loans
+loan_data <- loan_data[loan_data$Status != "Current", ]
+
+# Here I created the binary target variable
+loan_data$DefaultStatus <- ifelse(loan_data$Status == "Late", 1, 0)
+
+
+# Here I droped the date variables 
+
+date_drop <- c("LoanDate","ContractEndDate","FirstPaymentDate",
+  "MaturityDate_Original", "MaturityDate_Last","DebtOccuredOn",
+  "DebtOccuredOnForSecondary","GracePeriodStart", "GracePeriodEnd",
+  "NextPaymentDate", "ReScheduledOn", "DefaultDate", "MonthlyPaymentDay")
+
+loan_data <- loan_data %>% dplyr::select(-any_of(date_drop))
+
+date_cols <- names(loan_data)[grepl("Date", names(loan_data))]
+for(col in date_cols) loan_data[[col]] <- ymd(loan_data[[col]])
+
+
+```
+
+```{r}
+
+loan_data <- loan_data %>%
+  mutate(
+    Age = as.integer(Age),
+    AppliedAmount = as.numeric(AppliedAmount),
+    Amount = as.numeric(Amount),
+    Interest = as.numeric(Interest),
+    LoanDuration = as.integer(LoanDuration),
+    MonthlyPayment = as.numeric(MonthlyPayment),
+    IncomeFromPrincipalEmployer = as.numeric(IncomeFromPrincipalEmployer),
+    IncomeFromPension = as.numeric(IncomeFromPension),
+    IncomeFromFamilyAllowance = as.numeric(IncomeFromFamilyAllowance),
+    IncomeFromSocialWelfare = as.numeric(IncomeFromSocialWelfare),
+    IncomeFromLeavePay = as.numeric(IncomeFromLeavePay),
+    IncomeFromChildSupport = as.numeric(IncomeFromChildSupport),
+    IncomeOther = as.numeric(IncomeOther),
+    IncomeTotal = as.numeric(IncomeTotal),
+    ExistingLiabilities = as.integer(ExistingLiabilities),
+    LiabilitiesTotal = as.numeric(LiabilitiesTotal),
+    RefinanceLiabilities = as.integer(RefinanceLiabilities),
+    DebtToIncome = as.numeric(DebtToIncome),
+    FreeCash = as.numeric(FreeCash),
+    CreditScoreEeMini = as.numeric(CreditScoreEeMini),
+    NoOfPreviousLoansBeforeLoan = as.integer(NoOfPreviousLoansBeforeLoan),
+    AmountOfPreviousLoansBeforeLoan = as.numeric(AmountOfPreviousLoansBeforeLoan),
+    PreviousRepaymentsBeforeLoan = as.numeric(PreviousRepaymentsBeforeLoan),
+    PreviousEarlyRepaymentsCountBeforeLoan = as.integer(PreviousEarlyRepaymentsCountBeforeLoan),
+
+    Country = as.factor(Country),
+    UseOfLoan = as.factor(UseOfLoan),
+    VerificationType = as.factor(VerificationType),
+    Gender = as.factor(Gender),
+    NewCreditCustomer = as.factor(NewCreditCustomer),
+    LanguageCode = as.factor(LanguageCode),
+    Education = as.factor(Education),
+    MaritalStatus = as.factor(MaritalStatus),
+    EmploymentStatus = as.factor(EmploymentStatus),
+    EmploymentDurationCurrentEmployer = as.factor(EmploymentDurationCurrentEmployer),
+    OccupationArea = as.factor(OccupationArea),
+    HomeOwnershipType = as.factor(HomeOwnershipType),
+    Rating = as.factor(Rating),
+    DefaultStatus = as.factor(DefaultStatus),
+    CreditScoreEsMicroL = as.factor(CreditScoreEsMicroL))
+  
+```
+
+
+
+```{r}
+
+setDT(loan_data)
+
+categorical_vars <- c("Country", "UseOfLoan", "VerificationType", "Gender", 
+  "NewCreditCustomer","LanguageCode", "Education", "MaritalStatus", 
+  "EmploymentStatus", "EmploymentDurationCurrentEmployer", 
+  "OccupationArea", "HomeOwnershipType", "Rating","CreditScoreEsMicroL")
+
+numeric_vars <- setdiff(names(loan_data)[sapply(loan_data, is.numeric)], categorical_vars)
+
+loan_data[, (categorical_vars) := lapply(.SD, as.factor), .SDcols = categorical_vars]
+loan_data[, (numeric_vars) := lapply(.SD, as.numeric), .SDcols = numeric_vars]
+
+numeric_summary <- rbindlist(
+  lapply(numeric_vars, function(var) {
+    x <- loan_data[[var]]
+    data.table(
+      Variable = var,
+      Min = min(x, na.rm = TRUE),
+      Q1 = quantile(x, 0.25, na.rm = TRUE),
+      Median = median(x, na.rm = TRUE),
+      Mean = mean(x, na.rm = TRUE),
+      Q3 = quantile(x, 0.75, na.rm = TRUE),
+      Max = max(x, na.rm = TRUE),
+      SD = sd(x, na.rm = TRUE),
+      NA_Count = sum(is.na(x)),
+      NA_Percent = round(100 * sum(is.na(x)) / length(x), 2))
+  }), fill = TRUE)
+
+print(kable(
+  numeric_summary,
+  caption = "Summary Statistics for Numeric Variables (with SD & Missing %)",
+  digits = c(NA, 2, 2, 2, 2, 2, 2, 2, 0, 2)))
+
+for (var in categorical_vars) {
+  counts <- as.data.frame(table(loan_data[[var]], useNA = "ifany"))
+  colnames(counts) <- c(var, "Count")
+  print(kable(counts, caption = paste("Value Counts for", var)))}
+
+```
+
+```{r}
+# Here I started handling the categorical variables
+
+loan_data$EmploymentDurationCurrentEmployer <- as.character(loan_data$EmploymentDurationCurrentEmployer)
+
+loan_data$EmploymentDurationCurrentEmployer[is.na(loan_data$EmploymentDurationCurrentEmployer)] <- "Unknown"
+
+threshold <- 0.01
+n_total <- nrow(loan_data)
+counts <- table(loan_data$EmploymentDurationCurrentEmployer)
+rare_levels <- names(counts[counts < threshold * n_total])
+
+loan_data$EmploymentDurationCurrentEmployer[loan_data$EmploymentDurationCurrentEmployer %in% rare_levels] <- "Other"
+
+loan_data$EmploymentDurationCurrentEmployer <- factor(loan_data$EmploymentDurationCurrentEmployer)
+
+table(loan_data$EmploymentDurationCurrentEmployer, useNA = "ifany")
+
+```
+
+```{r}
+
+loan_data$MaritalStatus <- as.character(loan_data$MaritalStatus)
+
+loan_data$MaritalStatus[loan_data$MaritalStatus %in% c("-1", "0")] <- "Unknown"
+
+loan_data$MaritalStatus <- fct_explicit_na(factor(loan_data$MaritalStatus), na_level = "Unknown")
+
+loan_data$MaritalStatus <- factor(
+  loan_data$MaritalStatus,
+  levels = c("1", "2", "3", "4", "5", "Unknown"),
+  labels = c("Married", "Cohabitant", "Single", "Divorced", "Widow", "Unknown"))
+
+table(loan_data$MaritalStatus, useNA = "ifany")
+```
+
+```{r}
+
+loan_data$CreditScoreEsMicroL <- as.character(loan_data$CreditScoreEsMicroL)
+
+loan_data$CreditScoreEsMicroL[is.na(loan_data$CreditScoreEsMicroL)] <- "Unknown"
+
+score_counts <- table(loan_data$CreditScoreEsMicroL)
+
+common_levels <- names(score_counts[score_counts >= 1215])
+
+loan_data$CreditScoreEsMicroL[!(loan_data$CreditScoreEsMicroL %in% common_levels)] <- "Other"
+
+loan_data$CreditScoreEsMicroL <- factor(loan_data$CreditScoreEsMicroL)
+
+table(loan_data$CreditScoreEsMicroL, useNA = "ifany")
+
+```
+
+```{r}
+
+loan_data$Rating <- as.character(loan_data$Rating)
+
+loan_data$Rating[is.na(loan_data$Rating)] <- "Unknown"
+
+loan_data$Rating <- factor(loan_data$Rating)
+
+table(loan_data$Rating, useNA = "ifany")
+
+```
+
+```{r}
+
+loan_data$UseOfLoan <- as.character(loan_data$UseOfLoan)
+
+loan_data$UseOfLoan[loan_data$UseOfLoan == "-1"] <- "Unknown"
+
+business_other_codes <- as.character(101:110)
+loan_data$UseOfLoan[loan_data$UseOfLoan %in% business_other_codes] <- "Other"
+
+loan_data$UseOfLoan <- recode(loan_data$UseOfLoan,
+  "0" = "LoanConsolidation",
+  "1" = "RealEstate",
+  "2" = "HomeImprovement",
+  "3" = "Business",
+  "4" = "Education",
+  "5" = "Travel",
+  "6" = "Vehicle",
+  "7" = "OtherPersonal",
+  "8" = "Health")
+
+loan_data$UseOfLoan <- fct_explicit_na(factor(loan_data$UseOfLoan), na_level = "Unknown")
+
+loan_data$UseOfLoan <- factor(loan_data$UseOfLoan, levels = c(
+  "LoanConsolidation", "RealEstate", "HomeImprovement", "Business",
+  "Education", "Travel", "Vehicle", "OtherPersonal", "Health",
+  "Other", "Unknown"))
+
+table(loan_data$UseOfLoan, useNA = "ifany")
+
+```
+
+```{r}
+
+country_fullnames <- c(
+  "EE" = "Estonia",
+  "ES" = "Spain",
+  "FI" = "Finland",
+  "SK" = "Slovakia")
+
+loan_data$Country <- country_fullnames[loan_data$Country]
+loan_data$Country <- factor(loan_data$Country)
+
+table(loan_data$Country)
+
+```
+
+
+```{r}
+
+loan_data$VerificationType <- as.character(loan_data$VerificationType)
+
+loan_data$VerificationType[loan_data$VerificationType %in% c("0", NA)] <- "Unknown"
+
+loan_data$VerificationType <- factor(loan_data$VerificationType,
+  levels = c("1", "2", "3", "4", "Unknown"),
+  labels = c(
+    "Income unverified",
+    "Income unverified (phone)",
+    "Income verified",
+    "Income and expenses verified",
+    "Unknown"))
+
+table(loan_data$VerificationType, useNA = "ifany")
+```
+
+```{r}
+
+loan_data$Gender <- as.character(loan_data$Gender)
+
+loan_data$Gender[is.na(loan_data$Gender)] <- "Unknown"
+
+loan_data$Gender <- factor(loan_data$Gender,
+  levels = c("0", "1", "2", "Unknown"),
+  labels = c("Male", "Female", "Undefined", "Unknown"))
+
+table(loan_data$Gender, useNA = "ifany")
+```
+
+```{r}
+
+loan_data$LanguageCode <- as.character(loan_data$LanguageCode)
+
+common_codes <- c("1", "2", "3", "4", "6")
+
+loan_data$LanguageCode[is.na(loan_data$LanguageCode) | !(loan_data$LanguageCode %in% c(common_codes, "5", "9"))] <- "Unknown"
+
+loan_data$LanguageCode[loan_data$LanguageCode %in% c("5", "9")] <- "Other"
+
+loan_data$LanguageCode <- factor(
+  loan_data$LanguageCode,
+  levels = c("1", "2", "3", "4", "6", "Other", "Unknown"),
+  labels = c("Estonian", "English", "Russian", "Finnish", "Spanish", "Other", "Unknown"))
+
+table(loan_data$LanguageCode, useNA = "ifany")
+
+```
+
+```{r}
+loan_data$Education <- as.character(loan_data$Education)
+
+loan_data$Education[loan_data$Education %in% c("-1", "0", NA)] <- "Unknown"
+
+loan_data$Education <- factor(loan_data$Education,
+  levels = c("1", "2", "3", "4", "5", "Unknown"),
+  labels = c("Primary", "Basic", "Vocational", "Secondary", "Higher", "Unknown"))
+
+table(loan_data$Education, useNA = "ifany")
+```
+
+```{r}
+loan_data$EmploymentStatus <- as.character(loan_data$EmploymentStatus)
+
+loan_data$EmploymentStatus[loan_data$EmploymentStatus %in% c("-1", "0")] <- "Unknown"
+
+loan_data$EmploymentStatus <- dplyr::recode(
+  loan_data$EmploymentStatus,
+  "1" = "Unemployed",
+  "2" = "Partially employed",
+  "3" = "Fully employed",
+  "4" = "Self-employed",
+  "5" = "Entrepreneur",
+  "6" = "Retiree")
+
+loan_data$EmploymentStatus <- fct_explicit_na(
+  factor(loan_data$EmploymentStatus),
+  na_level = "Unknown")
+
+loan_data$EmploymentStatus <- factor(
+  loan_data$EmploymentStatus,
+  levels = c("Fully employed", "Partially employed", "Self-employed", "Entrepreneur",
+             "Retiree", "Unemployed", "Unknown"))
+
+table(loan_data$EmploymentStatus, useNA = "ifany")
+
+```
+
+```{r}
+loan_data$OccupationArea <- as.character(loan_data$OccupationArea)
+
+loan_data$OccupationArea[loan_data$OccupationArea == "-1"] <- "Unknown"
+loan_data$OccupationArea[is.na(loan_data$OccupationArea)] <- "Unknown"
+
+rare_levels <- c("0", "2", "4", "5", "12", "13", "14", "18", "19")
+loan_data$OccupationArea[loan_data$OccupationArea %in% rare_levels] <- "Other"
+
+loan_data$OccupationArea <- factor(loan_data$OccupationArea,
+  levels = c(
+    "1", "3", "6", "7", "8", "9", "10", "11", "15", "16", "17", "Other", "Unknown"),
+  labels = c(
+    "Other",                      
+    "Processing",                 
+    "Construction",             
+    "Retail and wholesale",     
+    "Transport and warehousing", 
+    "Hospitality and catering",  
+    "Info and telecom",          
+    "Finance and insurance",     
+    "Civil service & military",  
+    "Education",                 
+    "Healthcare and social help",
+    "Other",                     
+    "Unknown"))
+
+table(loan_data$OccupationArea, useNA = "ifany")
+
+```
+
+```{r}
+loan_data$HomeOwnershipType <- as.character(loan_data$HomeOwnershipType)
+
+loan_data$HomeOwnershipType[loan_data$HomeOwnershipType == "-1"] <- "Unknown"
+loan_data$HomeOwnershipType[is.na(loan_data$HomeOwnershipType)] <- "Unknown"
+
+rare_levels <- c("0", "9", "10")  
+loan_data$HomeOwnershipType[loan_data$HomeOwnershipType %in% rare_levels] <- "Other"
+
+loan_data$HomeOwnershipType <- factor(
+  loan_data$HomeOwnershipType,
+  levels = c("1", "2", "3", "4", "5", "6", "7", "8", "Other", "Unknown"),
+  labels = c(
+    "Owner",                         
+    "Living with parents",           
+    "Tenant (pre-furnished)",        
+    "Tenant (unfurnished)",          
+    "Council house",                 
+    "Joint tenant",                  
+    "Joint ownership",               
+    "Mortgage",                      
+    "Other",                         
+    "Unknown"))
+
+table(loan_data$HomeOwnershipType, useNA = "ifany")
+
+```
+
+```{r}
+
+# checking for Nas before/after cleaning
+
+setDT(loan_data)
+
+numeric_vars <- names(loan_data)[sapply(loan_data, is.numeric)]
+
+na_before <- sapply(loan_data[, ..numeric_vars], function(x) sum(is.na(x)))
+na_before_df <- data.table(Variable = names(na_before), NAs_Before = na_before)
+
+# Here I impute NAs with median
+
+for (var in numeric_vars) {
+  median_value <- median(loan_data[[var]], na.rm = TRUE)
+  loan_data[[var]][is.na(loan_data[[var]])] <- median_value}
+
+na_after <- sapply(loan_data[, ..numeric_vars], function(x) sum(is.na(x)))
+na_after_df <- data.table(Variable = names(na_after), NAs_After = na_after)
+
+na_summary <- merge(na_before_df, na_after_df, by = "Variable")
+
+knitr::kable(na_summary, caption = "NA Counts in Numeric Variables Before and After Median Imputation")
+
+```
+
+```{r}
+
+# removing nzv variables
+
+nzv_numeric <- nearZeroVar(loan_data[, numeric_vars, with = FALSE], saveMetrics = TRUE)
+
+nzv_numeric[nzv_numeric$nzv == TRUE, ]
+
+nzv_drop <- c(
+  "IncomeFromLeavePay",
+  "IncomeFromChildSupport",
+  "IncomeOther",
+  "RefinanceLiabilities",
+  "IncomeFromFamilyAllowance",
+  "IncomeFromSocialWelfare",
+  "IncomeFromPension",
+  "PreviousEarlyRepaymentsCountBeforeLoan",
+  "CreditScoreEeMini")
+
+loan_data <- loan_data[, !(names(loan_data) %in% nzv_drop), with = FALSE]
+
+```
+
+```{r}
+
+numeric_vars <- names(loan_data)[sapply(loan_data, is.numeric)]
+categorical_vars <- names(loan_data)[sapply(loan_data, is.factor)]
+
+target_var <- "DefaultStatus"
+
+```
+
+```{r}
+
+# barplot of target distribution
+
+class_counts <- as.data.frame(table(loan_data$DefaultStatus))
+colnames(class_counts) <- c("DefaultStatus", "Count")
+class_counts$Percent <- round(100 * class_counts$Count / sum(class_counts$Count), 1)
+
+ggplot(class_counts, aes(x = as.factor(DefaultStatus), y = Count, fill = as.factor(DefaultStatus))) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(
+    aes(y = Count / 2, label = paste0(Percent, "%")),
+    fontface = "bold",
+    size = 6,  
+    vjust = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "lightblue", "1" = "steelblue"),
+    name = "Default") +
+  labs(
+    x = "Default (0 = No, 1 = Yes)",
+    y = "Number of Loans") +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14))
+
+```
+```{r}
+
+# log-transformed boxplots for numeric vars
+
+loan_data$DefaultStatus <- factor(
+  ifelse(loan_data$DefaultStatus == "1", "Default", "No default"),
+  levels = c("No default", "Default"))
+
+boxplot_labels <- c(
+  Age = "Age (years)",
+  AppliedAmount = "Applied amount (€)",
+  Amount = "Funded amount (€)",
+  Interest = "Interest",
+  LoanDuration = "Loan duration (months)",
+  MonthlyPayment = "Monthly payment (€)",
+  IncomeTotal = "Total income (€)",
+  LiabilitiesTotal = "Total liabilities (€)",
+  DebtToIncome = "Debt-to-income ratio",
+  FreeCash = "Free cash (€)",
+  NoOfPreviousLoansBeforeLoan = "Previous loans (count)",
+  AmountOfPreviousLoansBeforeLoan = "Prev. loans amount (€)",
+  PreviousRepaymentsBeforeLoan = "Previous repayments (€)")
+
+humanize <- function(s) {
+  s <- gsub("([a-z])([A-Z])", "\\1 \\2", s)
+  gsub("_", " ", s)}
+
+choose_transform <- function(y) {
+  if (all(y > 0, na.rm = TRUE)) {
+    list(vals = log(y), label = "(log scale)")
+  } else if (all(y >= 0, na.rm = TRUE)) {
+    list(vals = log1p(y), label = "(log1p scale)")
+  } else {
+    list(vals = asinh(y), label = "(asinh scale)")}}
+
+par(mfrow = c(2, 2), mar = c(4.5, 5, 2, 1))
+for (var in numeric_vars) {
+  y <- loan_data[[var]]
+  tr <- choose_transform(y)
+  ylab_txt <- if (var %in% names(boxplot_labels)) boxplot_labels[[var]] else humanize(var)
+
+  df <- data.frame(DefaultStatus = loan_data$DefaultStatus, Value = tr$vals)
+
+  df$Value[!is.finite(df$Value)] <- NA
+
+  if (all(is.na(df$Value)) || diff(range(df$Value, na.rm = TRUE)) == 0) next
+
+  boxplot(
+    Value ~ DefaultStatus,
+    data = df,
+    xlab = "Default status",
+    ylab = paste(ylab_txt, tr$label),
+    col = c("lightblue", "steelblue"),
+    border = "darkblue",
+    notch = FALSE,
+    outline = TRUE)
+  grid(nx = NA, ny = NULL, col = "gray90", lty = "dotted")}
+par(mfrow = c(1, 1))
+
+```
+
+```{r}
+# barplots for cat vars
+
+par(mfrow = c(2, 2), mar = c(6, 4, 2, 2), xpd = TRUE) 
+
+categorical_vars <- setdiff(categorical_vars, "DefaultStatus")
+
+for (var in categorical_vars) {
+  valid_rows <- !is.na(loan_data[[var]]) & !is.na(loan_data$DefaultStatus)
+
+  freq_order <- sort(table(loan_data[[var]][valid_rows]), decreasing = TRUE)
+  
+  loan_data[[var]] <- factor(loan_data[[var]], levels = names(freq_order))
+
+  prop_tab <- prop.table(table(loan_data[[var]][valid_rows], loan_data$DefaultStatus[valid_rows]), margin = 2)
+  
+  barplot(
+    t(prop_tab),
+    beside = TRUE,
+    col = c("lightblue", "steelblue"),
+    ylab = "Proportion",
+    las = 2,  
+    cex.names = 0.8,
+    main = var)
+
+  legend(
+    "topright",
+    legend = c("No Default", "Default"),
+    fill = c("lightblue", "steelblue"),
+    bty = "n",
+    inset = c(-0.05, 0),
+    xpd = TRUE,
+    cex = 0.9)}
+
+```
+
+```{r}
+
+# correlation heatmap
+
+loan_data$DefaultStatus <- ifelse(loan_data$DefaultStatus == "Default", 1, 0)
+
+numeric_vars <- names(loan_data)[sapply(loan_data, is.numeric)]
+numeric_data <- loan_data[, ..numeric_vars]
+
+ordered_vars <- c("DefaultStatus", setdiff(numeric_vars, "DefaultStatus"))
+numeric_data <- numeric_data[, ..ordered_vars]
+
+corr_matrix <- cor(numeric_data, use = "pairwise.complete.obs")
+
+corr_matrix <- corr_matrix[ordered_vars, ordered_vars]
+
+
+corr_colors <- colorRampPalette(c("orange", "white", "steelblue"))(200)
+
+corrplot(
+  corr_matrix,
+  method = "color",
+  type = "upper",
+  order = "original",            
+  col = corr_colors,
+  tl.col = "black",
+  tl.cex = 0.8,
+  tl.srt = 90,
+  addCoef.col = "black",
+  number.cex = 0.6,
+  diag = FALSE,
+  mar = c(0, 0, 1, 0))
+
+```
+
+```{r}
+
+# LASSO feature selection
+
+df_lasso <- copy(loan_data)
+
+
+df_lasso$Status <- NULL  
+
+
+cat_vars_manual <- c(
+  "Country", "UseOfLoan", "VerificationType", "Gender", "NewCreditCustomer",
+  "LanguageCode", "Education", "MaritalStatus", 
+  "EmploymentStatus", "EmploymentDurationCurrentEmployer", 
+  "OccupationArea", "HomeOwnershipType", "Rating", 
+  "CreditScoreEsMicroL")
+
+
+char_cols <- names(df_lasso)[sapply(df_lasso, is.character)]
+df_lasso[, (char_cols) := lapply(.SD, as.factor), .SDcols = char_cols]
+
+collapse_levels <- function(x, threshold = 0.01) {
+  tab <- prop.table(table(x))
+  rare <- names(tab[tab < threshold])
+  x <- as.character(x)
+  x[x %in% rare] <- "Other"
+  factor(x)}
+
+high_card_vars <- c("UseOfLoan", "OccupationArea", "HomeOwnershipType", "EmploymentStatus")
+
+df_lasso[, (high_card_vars) := lapply(.SD, collapse_levels), .SDcols = high_card_vars]
+
+y <- as.numeric(as.character(df_lasso$DefaultStatus))
+
+df_lasso$DefaultStatus <- NULL
+
+x <- sparse.model.matrix(~ . - 1, data = df_lasso)
+
+cv_fit <- cv.glmnet(x, y, family = "binomial", alpha = 1, nfolds = 3)
+
+coef_lasso <- coef(cv_fit, s = "lambda.min")
+selected_features <- rownames(coef_lasso)[which(coef_lasso[, 1] != 0)]
+selected_features <- selected_features[selected_features != "(Intercept)"]
+
+feature_cols <- names(df_lasso)
+base_vars <- feature_cols[sapply(feature_cols, function(col) {
+  any(grepl(paste0("^", col), selected_features))})]
+
+base_vars <- sort(unique(base_vars))
+cat("Base variables selected by LASSO:\n")
+print(base_vars)
+
+```
+
+
+
+```{r}
+
+
+
+# Interaction Analysis
+
+set.seed(42)
+
+interaction_data <- as.data.table(loan_data)
+
+if (is.logical(interaction_data$DefaultStatus)) {
+  interaction_data[, DefaultStatus := as.integer(DefaultStatus)]}
+
+base_vars <- c(
+  "Age","Amount","AmountOfPreviousLoansBeforeLoan","AppliedAmount","Country",
+  "CreditScoreEsMicroL","DebtToIncome","Education","EmploymentDurationCurrentEmployer",
+  "EmploymentStatus","ExistingLiabilities","FreeCash","Gender","HomeOwnershipType",
+  "IncomeFromPrincipalEmployer","IncomeTotal","Interest","LanguageCode","LiabilitiesTotal",
+  "LoanDuration","MaritalStatus","MonthlyPayment","NewCreditCustomer",
+  "NoOfPreviousLoansBeforeLoan","OccupationArea","PreviousRepaymentsBeforeLoan",
+  "Rating","UseOfLoan","VerificationType")
+
+if (exists("df_lasso")) base_vars <- intersect(base_vars, names(df_lasso))
+vars <- unique(c(base_vars, "DefaultStatus"))
+vars <- intersect(vars, names(interaction_data))
+stopifnot(length(vars) > 1)
+
+interaction_data <- interaction_data[, ..vars]
+
+char_cols <- names(interaction_data)[sapply(interaction_data, is.character)]
+if (length(char_cols)) interaction_data[, (char_cols) := lapply(.SD, factor), .SDcols = char_cols]
+
+interaction_data <- interaction_data[!is.na(DefaultStatus)]
+
+borrower_vars <- c(
+  "Country","Age","AmountOfPreviousLoansBeforeLoan", "Gender","Education",
+  "EmploymentStatus","MaritalStatus","HomeOwnershipType","IncomeTotal",
+  "DebtToIncome","ExistingLiabilities","EmploymentDurationCurrentEmployer",
+  "NoOfPreviousLoansBeforeLoan","PreviousRepaymentsBeforeLoan",
+  "OccupationArea","CreditScoreEsMicroL","FreeCash","LiabilitiesTotal")
+loan_vars <- c(
+  "Interest","LoanDuration","Amount","AppliedAmount",
+  "MonthlyPayment","Rating","UseOfLoan","VerificationType",
+  "NewCreditCustomer","LanguageCode")
+
+present <- intersect(names(interaction_data), c(borrower_vars, loan_vars))
+borrower_vars2 <- intersect(borrower_vars, present)
+loan_vars2    <- intersect(loan_vars,     present)
+
+# Here I am scaling numeric predictors (mean 0, variance 1) except DefaultStatus
+
+num_cols <- setdiff(names(interaction_data)[sapply(interaction_data, is.numeric)], "DefaultStatus")
+if (length(num_cols)) interaction_data[, (num_cols) := lapply(.SD, scale), .SDcols = num_cols]
+
+base_fmla <- as.formula(paste("DefaultStatus ~", paste(c(borrower_vars2, loan_vars2), collapse = " + ")))
+fit_base <- suppressWarnings(glm(base_fmla, data = interaction_data, family = binomial()))
+AIC_base_val <- AIC(fit_base)
+
+
+
+test_interaction <- function(b, l) {
+  if (length(unique(interaction_data[[b]])) < 2 || length(unique(interaction_data[[l]])) < 2) return(NULL)
+  if (max(prop.table(table(interaction_data[[b]]))) > 0.98 || max(prop.table(table(interaction_data[[l]]))) > 0.98) return(NULL)
+
+  f_int <- update(base_fmla, paste(". ~ . +", paste0("`", b, "`:`", l, "`"))) # Here I am adding interaction term b:l to baseline formula
+  fit1  <- tryCatch(
+  suppressWarnings(glm(f_int, data = interaction_data, family = binomial())),
+  error = function(e) NULL)
+  if (is.null(fit1)) return(NULL)
+
+  lrt <- anova(fit_base, fit1, test = "LRT") |> broom::tidy()  # Likelihood Ratio Test (LRT) comparing baseline vs interaction model
+  p_lrt <- lrt$p.value[nrow(lrt)]
+
+  AIC_int <- AIC(fit1)
+
+  data.frame(
+    Borrower = b,
+    LoanTerm = l,
+    p_LRT = p_lrt,
+    AIC_base = AIC_base_val,
+    AIC_interaction = AIC_int,
+    dAIC_vs_base = AIC_base_val - AIC_int,                 
+    dLogLik = as.numeric(logLik(fit1) - logLik(fit_base)), 
+    stringsAsFactors = FALSE)}
+
+out <- list()
+for (b in borrower_vars2) for (l in setdiff(loan_vars2, b)) out[[length(out)+1]] <- test_interaction(b,l)
+res <- dplyr::bind_rows(out) |> dplyr::filter(!is.na(p_LRT))
+
+res <- res %>%
+  mutate(p_adj = p.adjust(p_LRT, method = "BH"))
+
+minAIC <- min(c(AIC_base_val, res$AIC_interaction), na.rm = TRUE)
+Delta_AIC_std_base <- AIC_base_val - minAIC
+
+res <- res %>%
+  mutate(
+    Delta_AIC_std = AIC_interaction - minAIC)
+
+denom <- sum(exp(-0.5 * c(Delta_AIC_std_base, res$Delta_AIC_std)))
+w_base <- exp(-0.5 * Delta_AIC_std_base) / denom
+res <- res %>%
+  mutate(
+    akaike_w = exp(-0.5 * Delta_AIC_std) / denom)
+
+
+res_sig <- res %>% filter(p_adj < 0.05) # Extracting significant interactions (adjusted p < 0.05) 
+res_ord <- res_sig %>% arrange(Delta_AIC_std)
+
+res_pub <- res_ord %>%
+  mutate(
+    p_adj_disp = formatC(p_adj, format = "e", digits = 2)) %>%
+  select(Borrower, LoanTerm,
+         AIC_interaction,
+         Delta_AIC_std,        
+         dAIC_vs_base,         
+         dLogLik,
+         akaike_w,
+         p_LRT, p_adj_disp)
+
+head(res_pub, 10)
+
+
+data.frame(
+  Model = "Baseline (no interaction)",
+  AIC = AIC_base_val,
+  Delta_AIC_std = Delta_AIC_std_base,
+  Akaike_weight = w_base)
+
+
+```
+
+
+
+
+```{r}
+
+# Creating a heatmap of the top interaction
+
+interaction_data <- as.data.table(loan_data)
+
+if (is.numeric(interaction_data$LoanDuration)) {
+  top_durs <- interaction_data[, .N, by = LoanDuration][order(-N)][1:8, LoanDuration]
+  interaction_data2 <- interaction_data[LoanDuration %in% top_durs]
+  interaction_data2 [, LoanDurationF := factor(LoanDuration, levels = sort(unique(top_durs)))]
+} else {
+  if (nlevels(factor(interaction_data$LoanDuration)) > 12) {
+    top_durs <- interaction_data[, .N, by = LoanDuration][order(-N)][1:12, LoanDuration]
+    interaction_data2 <- interaction_data[LoanDuration %in% top_durs]
+  } else {
+    interaction_data2 <- copy(interaction_data)
+    top_durs <- unique(dd$LoanDuration)
+  }
+  lvl_try <- suppressWarnings(sort(unique(as.numeric(as.character(top_durs)))))
+  if (all(!is.na(lvl_try))) {
+    interaction_data2[, LoanDurationF := factor(as.numeric(as.character(LoanDuration)), levels = lvl_try)]
+  } else {
+    interaction_data2[, LoanDurationF := factor(LoanDuration, levels = as.vector(top_durs))]}}
+
+interaction_data2[, Country := droplevels(factor(Country))]
+
+heatmap <- interaction_data2[, .(n = .N, default_rate = mean(DefaultStatus)), by = .(Country, LoanDurationF)]
+
+lvl_try2 <- suppressWarnings(sort(unique(as.numeric(as.character(levels(heatmap$LoanDurationF))))))
+if (all(!is.na(lvl_try2))) {
+  heatmap[, LoanDurationF := factor(LoanDurationF, levels = lvl_try2)]}
+
+plot_heatmap <- ggplot(heatmap, aes(x = LoanDurationF, y = Country, fill = default_rate)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(n > 0 & !is.na(default_rate),
+                               sprintf("%.0f%%\n(n=%d)", 100*default_rate, n), "")),
+            size = 3) +
+  scale_fill_gradient(low = "#f7fbff", high = "steelblue", na.value = "white",
+                      name = "Default rate") +
+  labs(x = "Loan duration (observed levels)",
+       y = "Country",
+       title = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+print(plot_heatmap)
+
+```
+
+
+
+```{r}
+
+# fitting the models
+
+set.seed(123)
+
+df_model <- copy(df_lasso)
+df_model$DefaultStatus <- ifelse(loan_data$DefaultStatus == 1, "Default", "NonDefault")
+df_model$DefaultStatus <- factor(df_model$DefaultStatus, levels = c("Default","NonDefault"))
+
+grid_glmnet <- expand.grid(alpha = c(0,1), lambda = c(1e-3,1e-2,1e-1))
+p <- ncol(df_model) - 1
+grid_rf <- expand.grid(mtry = round(c(sqrt(p), p/3, p/2)),
+                       splitrule = "gini", min.node.size = c(1,5))
+grid_xgb <- rbind(
+  expand.grid(nrounds=c(200,400), max_depth=c(3,5), eta=0.05,
+              gamma=0, colsample_bytree=0.8, min_child_weight=1, subsample=0.8),
+  expand.grid(nrounds=c(200,400), max_depth=3, eta=0.10,
+              gamma=0, colsample_bytree=0.8, min_child_weight=1, subsample=0.8))
+grid_mlp <- expand.grid(size=c(3,5,7), decay=c(0,0.0001))
+
+# Inner CV
+ctrl_base <- trainControl(
+  method = "cv", number = 3,   
+  classProbs = TRUE, summaryFunction = twoClassSummary,
+  sampling = "smote", savePredictions = "final")
+
+# performance metrics
+
+eval_metrics <- function(model, data, target_name="DefaultStatus", positive_class="Default") {
+  pred_class <- predict(model, data)
+  pred_prob  <- predict(model, data, type="prob")[, positive_class]
+  cm  <- confusionMatrix(pred_class, data[[target_name]], positive = positive_class)
+
+  roc_obj <- roc(response = data[[target_name]],
+                 predictor = pred_prob,
+                 levels = c("NonDefault","Default"), direction = "<")
+  auc_roc <- as.numeric(auc(roc_obj))
+
+  y <- ifelse(data[[target_name]] == positive_class, 1, 0)
+  pr_obj <- pr.curve(scores.class0 = pred_prob[y == 1],
+                     scores.class1 = pred_prob[y == 0], curve = FALSE)
+  auc_pr <- pr_obj$auc.integral
+  brier <- mean((pred_prob - y)^2)
+
+  data.frame(
+    Accuracy  = cm$overall["Accuracy"],
+    Precision = cm$byClass["Pos Pred Value"],
+    Recall    = cm$byClass["Sensitivity"],
+    F1        = cm$byClass["F1"],
+    AUC_ROC   = auc_roc,
+    AUC_PR    = auc_pr,
+    Brier     = brier)}
+
+# repeating 5 random splits
+
+n_repeats <- 5
+all_runs <- list()
+roc1 <- list()
+pr1  <- list()
+
+for (r in 1:n_repeats) {
+  set.seed(1000 + r)  
+  idx <- createDataPartition(df_model$DefaultStatus, p = 0.7, list = FALSE)
+  train <- df_model[idx, ]
+  test  <- df_model[-idx, ]
+
+  set.seed(2000 + r)
+  folds <- createFolds(train$DefaultStatus, k = 3, returnTrain = TRUE)
+  ctrl <- ctrl_base
+  ctrl$index <- folds
+
+  log_model <- train(DefaultStatus ~ ., data = train,
+                     method = "glmnet", metric = "ROC", trControl = ctrl,
+                     tuneGrid = grid_glmnet, preProcess = c("center","scale"))
+
+  rf_model <- train(DefaultStatus ~ ., data = train,
+                    method = "ranger", metric = "ROC", trControl = ctrl,
+                    tuneGrid = grid_rf, importance = "impurity")
+
+  xgb_model <- train(DefaultStatus ~ ., data = train,
+                     method = "xgbTree", metric = "ROC", trControl = ctrl,
+                     tuneGrid = grid_xgb)
+
+  mlp_model <- train(DefaultStatus ~ ., data = train,
+                     method = "nnet", metric = "ROC", trControl = ctrl,
+                     tuneGrid = grid_mlp, trace = FALSE,
+                     preProcess = c("center","scale"))
+
+  # evaluating on test set
+  res <- bind_rows(
+    Logistic_Regression = eval_metrics(log_model, test),
+    Random_Forest       = eval_metrics(rf_model,  test),
+    XGBoost             = eval_metrics(xgb_model, test),
+    MLP                 = eval_metrics(mlp_model, test),
+    .id = "Model")
+  res$Repeat <- r
+  all_runs[[r]] <- res
+
+  prob_list <- list(
+    Logistic_Regression = predict(log_model, test, type="prob")[,"Default"],
+    Random_Forest       = predict(rf_model,  test, type="prob")[,"Default"],
+    XGBoost             = predict(xgb_model, test, type="prob")[,"Default"],
+    MLP                 = predict(mlp_model, test, type="prob")[,"Default"])
+  y_true <- ifelse(test$DefaultStatus=="Default", 1, 0)
+
+  for (m in names(prob_list)) {
+    # ROC
+    roc_obj <- roc(response=test$DefaultStatus,
+                   predictor=prob_list[[m]],
+                   levels=c("NonDefault","Default"), direction="<")
+    roc1[[length(roc1)+1]] <- data.frame(
+      FPR = 1 - roc_obj$specificities,
+      TPR = roc_obj$sensitivities,
+      Model = m, Repeat = r)
+
+    # PR
+    pr_obj <- pr.curve(scores.class0=prob_list[[m]][y_true==1],
+                       scores.class1=prob_list[[m]][y_true==0], curve=TRUE)
+    pr1[[length(pr1)+1]] <- data.frame(
+      Recall = pr_obj$curve[,1],
+      Precision = pr_obj$curve[,2],
+      Model = m, Repeat = r)}}
+
+# mean ± SD metrics
+results_long <- bind_rows(all_runs)
+
+summary_tbl <- results_long %>%
+  group_by(Model) %>%
+  summarise(
+    across(
+      c(Accuracy, Precision, Recall, F1, AUC_ROC, AUC_PR, Brier),
+      list(mean = ~mean(., na.rm = TRUE),
+           sd   = ~sd(.,   na.rm = TRUE)),
+      .names = "{.col}_{.fn}"),
+    .groups = "drop")
+
+knitr::kable(summary_tbl, digits = 4,
+             caption = sprintf("Model performance over 5 random train/test splits (mean ± SD)"))
+
+
+```
+
+```{r}
+
+roc1 <- bind_rows(roc1)
+pr1  <- bind_rows(pr1)
+
+# average ROC across repeats
+roc2 <- roc1 %>%
+  group_by(Model, FPR) %>%
+  summarise(TPR = mean(TPR), .groups = "drop")
+
+# average PR across repeats
+
+pr2 <- pr1 %>%
+  group_by(Model, Recall) %>%
+  summarise(Precision = mean(Precision), .groups = "drop")
+
+# plots
+roc_plot <- ggplot(roc2, aes(x=FPR, y=TPR, color=Model)) +
+  geom_line(size=1.1) +
+  geom_abline(slope=1, intercept=0, linetype="dashed", color="grey50") +
+  labs(title="Average ROC Curves (5 splits)",  x="False Positive Rate", y="True Positive Rate") +
+  theme_minimal(base_size = 16) +              
+  theme(legend.title = element_text(size=14),  
+        legend.text  = element_text(size=13),  
+        axis.title   = element_text(size=14), 
+        axis.text    = element_text(size=12),  
+        plot.title   = element_text(size=16, face="bold")) 
+
+pr_plot <- ggplot(pr2, aes(x=Recall, y=Precision, color=Model)) +
+  geom_line(size=1.1) +
+  labs(title="Average PR Curves (5 splits)",  x="Recall",  y="Precision") +
+  theme_minimal(base_size = 16) +
+  theme(legend.title = element_text(size=14),
+        legend.text  = element_text(size=13),
+        axis.title   = element_text(size=14),
+        axis.text    = element_text(size=12),
+        plot.title   = element_text(size=16, face="bold"))
+
+roc_plot
+pr_plot
+
+```
+
+
+```{r}
+last_rf_imp <- rf_model$finalModel$variable.importance
+last_top5 <- data.frame(
+  Variable   = names(last_rf_imp),
+  Importance = as.numeric(last_rf_imp),
+  row.names  = NULL) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 5)
+
+knitr::kable(last_top5, digits = 2,
+             caption = "Random Forest (last repeat) — top 5 variables by Gini importance")
+
+```
+
+```{r}
+
+# Core software
+
+citation()                 
+citation("caret")
+citation("glmnet")
+citation("ranger")
+citation("xgboost")
+citation("nnet")
+
+# Evaluation
+
+citation("pROC")
+citation("PRROC")
+
+# Class imbalance
+
+citation("UBL")
+
+# Data handling
+
+citation("data.table")
+citation("dplyr")
+citation("tidyr")
+citation("forcats")
+citation("Matrix")
+
+# Visualisation
+
+citation("ggplot2")
+citation("corrplot")
+
+
+```
